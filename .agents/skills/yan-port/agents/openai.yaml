@@ -1,0 +1,4 @@
+interface:
+  display_name: "YanPort"
+  short_description: "Manage safe local routes and worktree leases"
+  default_prompt: "Use $yan-port to inspect or manage this project’s isolated local development routes."

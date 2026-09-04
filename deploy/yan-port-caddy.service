@@ -1,0 +1,42 @@
+[Unit]
+Description=YanPort local Caddy front door
+After=network.target
+Documentation=https://caddyserver.com/docs/
+
+[Service]
+Type=notify
+User=caddy
+Group=yan-port
+RuntimeDirectory=yan-port
+RuntimeDirectoryMode=0770
+StateDirectory=yan-port
+StateDirectoryMode=0770
+Environment=XDG_DATA_HOME=/var/lib/yan-port/data
+Environment=XDG_CONFIG_HOME=/var/lib/yan-port/config
+ExecStart=/usr/local/bin/caddy run --environ --config /var/lib/yan-port/Caddyfile --adapter caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /var/lib/yan-port/Caddyfile --adapter caddyfile --address unix//run/yan-port/caddy-admin.sock
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/yan-port /run/yan-port
+
+[Install]
+WantedBy=multi-user.target

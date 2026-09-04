@@ -1,0 +1,12 @@
+{
+	admin unix//run/yan-port/caddy-admin.sock|0660
+	http_port 80
+	https_port 443
+	auto_https disable_redirects
+	persist_config off
+}
+
+:2018 {
+	bind 127.0.0.1
+	respond "YanPort ready"
+}
