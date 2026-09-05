@@ -6,6 +6,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.14"
 dependencies = [
+  "cryptography>=45.0.0",
   "typer>=0.17.0",
 ]
 

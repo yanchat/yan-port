@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
+import json
 import os
 import re
+import socket
 import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
@@ -106,12 +109,29 @@ def render_caddyfile(
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path: str, *, timeout: float = 2.0) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self) -> None:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(self.timeout)
+        try:
+            connection.connect(self.socket_path)
+        except BaseException:
+            connection.close()
+            raise
+        self.sock = connection
+
+
 class CaddyController:
     def __init__(
         self,
         *,
         config_path: Path | str | None = None,
         admin_socket: str | None = None,
+        root_ca_path: Path | str | None = None,
         runner: Runner = subprocess.run,
     ) -> None:
         self.config_path = Path(
@@ -122,6 +142,13 @@ class CaddyController:
         self.https_port = int(os.environ.get("YAN_PORT_HTTPS_PORT", "443"))
         self.admin_socket = admin_socket or os.environ.get(
             "YAN_PORT_CADDY_ADMIN_SOCKET", "/run/yan-port/caddy-admin.sock"
+        )
+        self.root_ca_path = Path(
+            root_ca_path
+            or os.environ.get(
+                "YAN_PORT_CADDY_ROOT_CA",
+                "/var/lib/yan-port/data/caddy/pki/authorities/local/root.crt",
+            )
         )
         self.runner = runner
 
@@ -199,3 +226,38 @@ class CaddyController:
 
     def status(self) -> str:
         return self._run(["systemctl", "is-active", "yan-port-caddy.service"]).stdout.strip()
+
+    def fetch_root_certificate(self) -> bytes:
+        """Fetch Caddy's active public root without reading its private data directory."""
+        connection = _UnixHTTPConnection(self.admin_socket)
+        try:
+            connection.request("GET", "/pki/ca/local")
+            response = connection.getresponse()
+            body = response.read()
+        except FileNotFoundError as exc:
+            raise CaddyError(f"Caddy admin socket is missing: {self.admin_socket}") from exc
+        except PermissionError as exc:
+            raise CaddyError(
+                f"Permission denied accessing Caddy admin socket: {self.admin_socket}"
+            ) from exc
+        except OSError as exc:
+            raise CaddyError(
+                f"Cannot contact Caddy admin socket {self.admin_socket}: {exc}"
+            ) from exc
+        finally:
+            connection.close()
+        if response.status != 200:
+            detail = body.decode(errors="replace").strip()
+            raise CaddyError(
+                f"Caddy PKI API returned HTTP {response.status}" + (f": {detail}" if detail else "")
+            )
+        try:
+            payload = json.loads(body)
+            root = payload["root_certificate"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise CaddyError(
+                "Caddy PKI API returned a malformed root certificate response"
+            ) from exc
+        if not isinstance(root, str) or "-----BEGIN CERTIFICATE-----" not in root:
+            raise CaddyError("Caddy PKI API did not return a PEM root certificate")
+        return root.encode()

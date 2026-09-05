@@ -21,11 +21,13 @@ reservation_app = typer.Typer(
     help="Manage exclusive machine-wide reservations.", no_args_is_help=True
 )
 router_app = typer.Typer(help="Inspect and update the Caddy front door.", no_args_is_help=True)
+trust_app = typer.Typer(help="Inspect and export local certificate trust.", no_args_is_help=True)
 app.add_typer(context_app, name="context")
 app.add_typer(port_app, name="port")
 app.add_typer(route_app, name="route")
 app.add_typer(reservation_app, name="reservation")
 app.add_typer(router_app, name="router")
+app.add_typer(trust_app, name="trust")
 
 
 def _service() -> YanPortService:
@@ -50,6 +52,48 @@ def _run(operation: Any) -> Any:
     except (YanPortError, ValueError, RuntimeError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc
+
+
+def _format_fingerprint(fingerprint: str | None) -> str:
+    if fingerprint is None:
+        return "unavailable"
+    rendered = fingerprint.upper()
+    return ":".join(rendered[index : index + 2] for index in range(0, len(rendered), 2))
+
+
+def _emit_trust_status(payload: dict[str, Any]) -> None:
+    typer.echo(f"Trust state: {payload['state']}")
+    root = payload["root_ca"]
+    typer.echo(f"Active root CA path: {root['path']}")
+    typer.echo(f"Active root SHA-256: {_format_fingerprint(root['sha256'])}")
+    system = payload["system_trust"]
+    typer.echo(f"System CA anchor: {system['anchor_path']}")
+    typer.echo(f"System anchor SHA-256: {_format_fingerprint(system['anchor_sha256'])}")
+    typer.echo(f"Installed in system trust store: {'yes' if system['installed'] else 'no'}")
+    typer.echo(f"System anchor matches active root: {'yes' if system['matches_active'] else 'no'}")
+    if payload["routes"]:
+        typer.echo("Routes:")
+    for route in payload["routes"]:
+        typer.echo(f"  {route['hostname']}")
+        typer.echo(f"    Leaf SHA-256: {_format_fingerprint(route['leaf_sha256'])}")
+        typer.echo(f"    TLS reachable: {'yes' if route['tls_reachable'] else 'no'}")
+        typer.echo(
+            f"    Chains to active root: {'yes' if route['chains_to_active_root'] else 'no'}"
+        )
+        typer.echo(f"    Hostname appears in SAN: {'yes' if route['san_matches'] else 'no'}")
+        typer.echo(f"    System TLS trust: {'yes' if route['system_trusted'] else 'no'}")
+        typer.echo(
+            f"    Upstream listening: {'yes' if route['upstream_listening'] else 'no'} "
+            f"({route['upstream']})"
+        )
+    if payload["warnings"]:
+        typer.echo("Warnings:")
+        for warning in payload["warnings"]:
+            typer.echo(f"  - {warning}")
+    if payload["problems"]:
+        typer.echo("Problems:")
+        for problem in payload["problems"]:
+            typer.echo(f"  - {problem}")
 
 
 @context_app.command("inspect")
@@ -246,6 +290,42 @@ def doctor(
     _emit(payload, as_json=json_output)
     if not payload["ok"]:
         raise typer.Exit(1)
+
+
+@trust_app.command("status")
+def trust_status(
+    hostname: Annotated[
+        str | None, typer.Option("--host", help="Exact registered .localhost route to inspect.")
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON.")
+    ] = False,
+) -> None:
+    payload = _run(lambda: _service().trust_status(hostname))
+    if json_output:
+        _emit(payload, as_json=True)
+    else:
+        _emit_trust_status(payload)
+    if not payload["ok"]:
+        raise typer.Exit(1)
+
+
+@trust_app.command("export")
+def trust_export(
+    output: Annotated[Path, typer.Option(help="Destination for the active public root CA.")],
+    force: Annotated[
+        bool, typer.Option("--force", help="Atomically replace a differing regular file.")
+    ] = False,
+) -> None:
+    payload = _run(lambda: _service().trust_export(output, force=force))
+    action = "Exported" if payload["changed"] else "Already current"
+    typer.echo(f"{action}: {payload['output']}")
+    typer.echo(f"SHA-256: {_format_fingerprint(payload['sha256'])}")
+    if payload["changed"] and payload["replaced_sha256"]:
+        if payload["replaced_sha256"] == payload["sha256"]:
+            typer.echo("Replaced matching certificate with canonical root-only PEM.")
+        else:
+            typer.echo(f"Replaced SHA-256: {_format_fingerprint(payload['replaced_sha256'])}")
 
 
 @router_app.command("render")

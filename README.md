@@ -4,9 +4,9 @@ YanPort is an ownership-safe routing layer for local development projects.
 It gives the primary checkout and each Git worktree isolated route, port, and
 exclusive-resource leases while one native Caddy process owns ports 80 and 443.
 
-The initial release is intentionally local-only. It accepts exact `.localhost`
-hostnames, proxies only to loopback HTTP upstreams, and sends all browser HTTP
-traffic to HTTPS.
+YanPort is intentionally local-only. It accepts exact `.localhost` hostnames,
+proxies only to loopback HTTP upstreams, and redirects HTTP to HTTPS only for
+registered exact hostnames.
 
 ## Development
 
@@ -26,11 +26,24 @@ yan-port route apply api \
   --host api.example.localhost \
   --upstream "http://127.0.0.1:${port}" \
   --port-service api
+yan-port trust status --host api.example.localhost
 yan-port status --json
 ```
 
 Project tooling should call YanPort; agents and projects must not edit the
 generated Caddy configuration or registry directly.
+
+YanPort installs Caddy's local CA into the Linux system trust store during the
+first native-Caddy cutover. Some Chromium and Electron applications use trust
+state that differs from command-line system clients. Use `yan-port trust status`
+to separate routing, certificate, system-trust, embedded-browser, and upstream
+problems. Use `yan-port trust export --output ./yan-port-root.crt` for an
+explicit manual import; YanPort never discovers or modifies browser profiles.
+
+See [Local certificate trust](docs/trust.md) for Chrome, Chromium, Electron,
+Codex, containers, CI, and direct-HTTP guidance. Application launchers should
+follow the [application CLI lifecycle](docs/application-lifecycle.md) while
+remaining responsible for their own processes.
 
 The packaged wheel supplies the `yan-port` CLI. Native Caddy installation and
 first-machine cutover use the repository's `deploy/`, `scripts/`, and `justfile`

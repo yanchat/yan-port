@@ -16,6 +16,7 @@ from .caddy import CaddyController, validate_domain, validate_hostname, validate
 from .context import detect_context
 from .errors import CaddyError, ConflictError, ContextError
 from .registry import StateStore
+from .trust import TrustInspector
 
 
 def _now() -> int:
@@ -62,9 +63,16 @@ def _port_available(port: int) -> bool:
 
 
 class YanPortService:
-    def __init__(self, store: StateStore, caddy: CaddyController) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        caddy: CaddyController,
+        *,
+        trust: TrustInspector | None = None,
+    ) -> None:
         self.store = store
         self.caddy = caddy
+        self.trust = trust or TrustInspector(caddy)
 
     def inspect_context(self, cwd: Path | str | None = None) -> dict[str, str]:
         return detect_context(cwd).as_dict()
@@ -562,27 +570,37 @@ class YanPortService:
             registry = self._recover_route_transaction(self.store.load())
             return self.store.clone(registry)
 
+    def trust_status(self, hostname: str | None = None) -> dict[str, Any]:
+        return self.trust.status(self.status(), hostname=hostname)
+
+    def trust_export(self, output: Path | str, *, force: bool = False) -> dict[str, Any]:
+        return self.trust.export(self.status(), output, force=force)
+
     def doctor(self) -> dict[str, Any]:
         with self.store.lock():
-            registry = self.store.load()
-            hosts: dict[str, str] = {}
-            problems: list[str] = []
-            for context in registry["contexts"].values():
-                if not Path(context["checkout_path"]).exists():
-                    problems.append(
-                        f"stale context path: {context['project']}:{context['context_id']}"
-                    )
-                for route in context["routes"].values():
-                    previous = hosts.get(route["hostname"])
-                    if previous:
-                        problems.append(f"duplicate host: {route['hostname']} ({previous})")
-                    hosts[route["hostname"]] = context["owner_id"]
-            return {
-                "ok": not problems and not self.store.journal_path.exists(),
-                "generation": registry["generation"],
-                "contexts": len(registry["contexts"]),
-                "routes": len(hosts),
-                "reservations": len(registry["reservations"]),
-                "pending_route_transaction": self.store.journal_path.exists(),
-                "problems": problems,
-            }
+            registry = self.store.clone(self.store.load())
+            pending_route_transaction = self.store.journal_path.exists()
+        hosts: dict[str, str] = {}
+        problems: list[str] = []
+        for context in registry["contexts"].values():
+            if not Path(context["checkout_path"]).exists():
+                problems.append(f"stale context path: {context['project']}:{context['context_id']}")
+            for route in context["routes"].values():
+                previous = hosts.get(route["hostname"])
+                if previous:
+                    problems.append(f"duplicate host: {route['hostname']} ({previous})")
+                hosts[route["hostname"]] = context["owner_id"]
+        trust = self.trust.status(registry)
+        problems.extend(str(problem) for problem in trust["problems"])
+        warnings = [str(warning) for warning in trust["warnings"]]
+        return {
+            "ok": not problems and not pending_route_transaction,
+            "generation": registry["generation"],
+            "contexts": len(registry["contexts"]),
+            "routes": len(hosts),
+            "reservations": len(registry["reservations"]),
+            "pending_route_transaction": pending_route_transaction,
+            "problems": problems,
+            "warnings": warnings,
+            "trust": trust,
+        }

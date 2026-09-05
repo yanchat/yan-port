@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
+import socket
 import stat
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -14,6 +17,7 @@ from yan_port.caddy import (
     validate_hostname,
     validate_upstream,
 )
+from yan_port.errors import CaddyError
 from yan_port.registry import empty_registry
 
 
@@ -122,3 +126,55 @@ def test_native_service_recovers_after_failure() -> None:
     unit = (Path(__file__).parents[1] / "deploy" / "yan-port-caddy.service").read_text()
     assert "Restart=on-failure" in unit
     assert "RestartSec=2s" in unit
+
+
+def _serve_unix_response(socket_path: Path, body: bytes) -> threading.Thread:
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+
+    def serve() -> None:
+        with listener:
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(4096)
+                response = (
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                    + str(len(body)).encode()
+                    + b"\r\nConnection: close\r\n\r\n"
+                    + body
+                )
+                connection.sendall(response)
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    return thread
+
+
+def test_fetch_root_certificate_uses_permissioned_admin_socket(tmp_path: Path) -> None:
+    socket_path = tmp_path / "admin.sock"
+    root = "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"
+    thread = _serve_unix_response(
+        socket_path,
+        json.dumps({"root_certificate": root}).encode(),
+    )
+    controller = CaddyController(admin_socket=str(socket_path))
+
+    fetched = controller.fetch_root_certificate()
+    thread.join(timeout=2)
+
+    assert fetched == root.encode()
+    assert not thread.is_alive()
+
+
+def test_fetch_root_certificate_categorizes_socket_and_response_errors(tmp_path: Path) -> None:
+    missing = CaddyController(admin_socket=str(tmp_path / "missing.sock"))
+    with pytest.raises(CaddyError, match="admin socket is missing"):
+        missing.fetch_root_certificate()
+
+    socket_path = tmp_path / "malformed.sock"
+    thread = _serve_unix_response(socket_path, b"{}")
+    malformed = CaddyController(admin_socket=str(socket_path))
+    with pytest.raises(CaddyError, match="malformed root certificate response"):
+        malformed.fetch_root_certificate()
+    thread.join(timeout=2)

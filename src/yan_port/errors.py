@@ -15,3 +15,7 @@ class ConflictError(YanPortError):
 
 class CaddyError(YanPortError):
     """Caddy rejected a candidate configuration or could not be contacted."""
+
+
+class TrustError(YanPortError):
+    """Local certificate trust could not be inspected or changed safely."""

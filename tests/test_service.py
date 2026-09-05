@@ -56,6 +56,17 @@ class NoopCaddy:
         return render_caddyfile(registry, admin_socket=self.admin_socket)
 
 
+class FixedTrustInspector:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def status(
+        self, registry: dict[str, object], *, hostname: str | None = None
+    ) -> dict[str, object]:
+        del registry, hostname
+        return self.payload
+
+
 def allocate_worker(state_root: str, checkout: str, name: str) -> int:
     manager = YanPortService(StateStore(state_root), NoopCaddy())  # type: ignore[arg-type]
     return int(manager.allocate_port(name, cwd=checkout, preferred=25173)["port"])
@@ -416,3 +427,49 @@ def test_concurrent_processes_never_receive_the_same_port(
         ports = pool.starmap(allocate_worker, arguments)
     assert len(ports) == len(set(ports))
     assert 25173 in ports
+
+
+def test_doctor_includes_trust_problems_and_warnings(tmp_path: Path) -> None:
+    trust_payload: dict[str, object] = {
+        "ok": False,
+        "state": "unhealthy",
+        "root_ca": {"available": True, "sha256": "a" * 64},
+        "system_trust": {"installed": False, "matches_active": False},
+        "routes": [],
+        "problems": ["system trust store does not contain the active root CA"],
+        "warnings": ["embedded browser profile trust cannot be verified"],
+    }
+    manager = YanPortService(
+        StateStore(tmp_path / "state"),
+        NoopCaddy(),  # type: ignore[arg-type]
+        trust=FixedTrustInspector(trust_payload),  # type: ignore[arg-type]
+    )
+
+    payload = manager.doctor()
+
+    assert payload["ok"] is False
+    assert payload["trust"] == trust_payload
+    assert payload["warnings"] == ["embedded browser profile trust cannot be verified"]
+    assert "system trust store does not contain" in payload["problems"][0]
+
+
+def test_doctor_keeps_trust_warnings_nonfatal(tmp_path: Path) -> None:
+    trust_payload: dict[str, object] = {
+        "ok": True,
+        "state": "healthy",
+        "root_ca": {"available": True, "sha256": "a" * 64},
+        "system_trust": {"installed": True, "matches_active": True},
+        "routes": [],
+        "problems": [],
+        "warnings": ["upstream is not listening"],
+    }
+    manager = YanPortService(
+        StateStore(tmp_path / "state"),
+        NoopCaddy(),  # type: ignore[arg-type]
+        trust=FixedTrustInspector(trust_payload),  # type: ignore[arg-type]
+    )
+
+    payload = manager.doctor()
+
+    assert payload["ok"] is True
+    assert payload["warnings"] == ["upstream is not listening"]
