@@ -542,6 +542,7 @@ class DockerCaddyController(CaddyController):
                     try:
                         self._reload_path(backup)
                         shutil.copyfile(backup, candidate)
+                        candidate.chmod(0o600)
                         with candidate.open("rb") as handle:
                             os.fsync(handle.fileno())
                         candidate.replace(self.config_path)

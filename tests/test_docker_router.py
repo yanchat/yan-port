@@ -222,6 +222,8 @@ def test_persistence_failure_restores_previous_live_configuration(
     assert live == (["new\n"] if rollback_fails else ["new\n", "old\n"])
     staging = list(controller.router_path.glob(".reload-*"))
     assert bool(staging) is rollback_fails
+    if not rollback_fails:
+        assert stat.S_IMODE(controller.config_path.stat().st_mode) == 0o600
     if rollback_fails:
         assert (staging[0] / "previous").read_text() == "old\n"
 
