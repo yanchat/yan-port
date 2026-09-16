@@ -13,6 +13,100 @@ from yan_port.cli import app
 runner = CliRunner()
 
 
+@pytest.mark.parametrize(
+    "command,failure",
+    [
+        ("provision-native", None),
+        ("provision-native", 1),
+        ("provision-native", 2),
+        ("provision-native", 3),
+        ("activate-native", None),
+        ("activate-native", 1),
+    ],
+)
+def test_native_provisioning_uses_packaged_scripts_and_stops_on_failure(
+    tmp_path, monkeypatch, failure, command
+):
+    package = tmp_path / "package with spaces"
+    assets = package / "native"
+    names = (
+        "scripts/install-service.sh",
+        "scripts/install-caddy-binary.sh",
+        "scripts/activate-service.sh",
+        "deploy/bootstrap.Caddyfile",
+        "deploy/yan-port-caddy.service",
+        "deploy/yan-port-caddy-cutover.service",
+    )
+    for name in names:
+        target = assets / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("fixture")
+    monkeypatch.setattr(cli, "__file__", str(package / "cli.py"))
+    monkeypatch.setattr(cli, "_SYSTEMD_RUNTIME", tmp_path)
+    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(cli.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(cli.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(cli.shutil, "which", lambda command: f"/usr/bin/{command}")
+    calls = []
+
+    def run(command, *, check):
+        assert check is True
+        calls.append(command)
+        if len(calls) == failure:
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    result = runner.invoke(app, ["router", command, "--yes"])
+    assert result.exit_code == (1 if failure else 0), result.output
+    expected = [
+        ["sudo", "--", "/bin/bash", str(assets / "scripts/install-service.sh"), "--check"],
+        ["sudo", "--", "/bin/bash", str(assets / "scripts/install-caddy-binary.sh")],
+        ["sudo", "--", "/bin/bash", str(assets / "scripts/install-service.sh")],
+    ]
+    if command == "activate-native":
+        expected = [
+            ["sudo", "--", "/bin/bash", str(assets / "scripts/activate-service.sh"), "--yes"]
+        ]
+    assert calls == expected[:failure] if failure else calls == expected
+    if failure is None and command == "provision-native":
+        assert "not started" in result.output
+
+
+@pytest.mark.parametrize("command", ["provision-native", "activate-native"])
+def test_native_provisioning_requires_explicit_approval(monkeypatch, command):
+    monkeypatch.setattr(cli, "_run_native_scripts", lambda: pytest.fail("unapproved provisioning"))
+    result = runner.invoke(app, ["router", command])
+    assert result.exit_code == 1
+    assert "pass --yes" in result.output
+
+
+@pytest.mark.parametrize(
+    "defect", ["platform", "architecture", "root", "systemd", "tools", "assets"]
+)
+def test_native_provisioning_preflight_never_invokes_sudo(tmp_path, monkeypatch, defect):
+    monkeypatch.setattr(
+        cli.platform, "system", lambda: "Darwin" if defect == "platform" else "Linux"
+    )
+    monkeypatch.setattr(
+        cli.platform, "machine", lambda: "arm64" if defect == "architecture" else "x86_64"
+    )
+    monkeypatch.setattr(cli.os, "geteuid", lambda: 0 if defect == "root" else 1000)
+    monkeypatch.setattr(
+        cli, "_SYSTEMD_RUNTIME", tmp_path / "absent" if defect == "systemd" else tmp_path
+    )
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda command: None if defect == "tools" else f"/usr/bin/{command}"
+    )
+    if defect == "assets":
+        monkeypatch.setattr(cli, "__file__", str(tmp_path / "missing" / "package" / "cli.py"))
+    monkeypatch.setattr(
+        cli.subprocess, "run", lambda *args, **kwargs: pytest.fail("unexpected sudo")
+    )
+    result = runner.invoke(app, ["router", "provision-native", "--yes"])
+    assert result.exit_code == 1
+    assert "error:" in result.output
+
+
 def git(cwd: Path, *arguments: str) -> None:
     subprocess.run(["git", *arguments], cwd=cwd, check=True, capture_output=True, text=True)
 
@@ -53,6 +147,7 @@ def test_router_render_accepts_cutover_ports(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("YAN_PORT_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("YAN_PORT_ROUTER_DRIVER", "native")
     result = runner.invoke(
         app,
         [

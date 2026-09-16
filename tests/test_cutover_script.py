@@ -3,7 +3,17 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import tempfile
 from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def socket_root():
+    with tempfile.TemporaryDirectory(prefix="yp-", dir="/tmp") as directory:
+        yield Path(directory)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -58,12 +68,13 @@ def _fake_docker_environment(tmp_path: Path, matching_hosts: str) -> dict[str, s
     return environment
 
 
-def test_docker_endpoint_selection_probes_each_candidate(tmp_path: Path) -> None:
-    first = tmp_path / "desktop.sock"
-    second = tmp_path / "rootless.sock"
-    with socket.socket(socket.AF_UNIX) as first_socket, socket.socket(
-        socket.AF_UNIX
-    ) as second_socket:
+def test_docker_endpoint_selection_probes_each_candidate(tmp_path: Path, socket_root: Path) -> None:
+    first = socket_root / "desktop.sock"
+    second = socket_root / "rootless.sock"
+    with (
+        socket.socket(socket.AF_UNIX) as first_socket,
+        socket.socket(socket.AF_UNIX) as second_socket,
+    ):
         first_socket.bind(str(first))
         second_socket.bind(str(second))
         expected = f"unix://{second}"
@@ -84,12 +95,15 @@ def test_docker_endpoint_selection_probes_each_candidate(tmp_path: Path) -> None
     assert result.stdout.strip() == expected
 
 
-def test_docker_endpoint_selection_refuses_ambiguous_daemons(tmp_path: Path) -> None:
-    first = tmp_path / "desktop.sock"
-    second = tmp_path / "rootless.sock"
-    with socket.socket(socket.AF_UNIX) as first_socket, socket.socket(
-        socket.AF_UNIX
-    ) as second_socket:
+def test_docker_endpoint_selection_refuses_ambiguous_daemons(
+    tmp_path: Path, socket_root: Path
+) -> None:
+    first = socket_root / "desktop.sock"
+    second = socket_root / "rootless.sock"
+    with (
+        socket.socket(socket.AF_UNIX) as first_socket,
+        socket.socket(socket.AF_UNIX) as second_socket,
+    ):
         first_socket.bind(str(first))
         second_socket.bind(str(second))
         matches = f"unix://{first},unix://{second}"

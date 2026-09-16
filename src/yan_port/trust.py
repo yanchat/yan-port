@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import platform
 import socket
 import ssl
 import stat
+import subprocess
 import tempfile
 import warnings
 from collections.abc import Callable, Iterable
@@ -35,6 +37,7 @@ class TrustCaddy(Protocol):
 
 
 RouteProbe = Callable[[str, str, bytes, int], dict[str, Any]]
+StoreContains = Callable[[str], bool]
 
 
 def load_certificate(data: bytes) -> x509.Certificate:
@@ -106,6 +109,32 @@ def _store_contains(fingerprint: str, paths: Iterable[Path]) -> bool:
     return False
 
 
+def _macos_keychain_contains(
+    fingerprint: str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> bool:
+    result = runner(
+        [
+            "/usr/bin/security",
+            "find-certificate",
+            "-a",
+            "-p",
+            "/Library/Keychains/System.keychain",
+        ],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return False
+    return any(
+        certificate_sha256(certificate) == fingerprint
+        for certificate in _certificates_in_data(result.stdout.encode())
+    )
+
+
 def _connect_tls(hostname: str, https_port: int, context: ssl.SSLContext) -> ssl.SSLSocket:
     raw = socket.create_connection(("127.0.0.1", https_port), timeout=2.0)
     try:
@@ -122,6 +151,27 @@ def _upstream_listening(upstream: str) -> tuple[bool, str | None]:
             return True, None
     except OSError as exc:
         return False, str(exc)
+
+
+def _macos_verify_chain(
+    hostname: str, chain: list[bytes], *, runner: Callable[..., Any] = subprocess.run
+) -> tuple[bool, str | None]:
+    # Supply the peer chain, never an explicit trust anchor: Keychain decides trust.
+    with tempfile.TemporaryDirectory(prefix="yan-port-trust-") as directory:
+        command = ["/usr/bin/security", "verify-cert", "-L", "-p", "ssl", "-n", hostname]
+        for index, certificate in enumerate(chain):
+            path = Path(directory) / f"peer-{index}.der"
+            path.write_bytes(certificate)
+            command.extend(["-c", str(path)])
+        try:
+            result = runner(command, capture_output=True, text=True, check=False, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, str(exc)
+    return result.returncode == 0, (
+        None
+        if result.returncode == 0
+        else (result.stderr or result.stdout).strip() or "macOS certificate verification failed"
+    )
 
 
 def probe_route(hostname: str, upstream: str, root_pem: bytes, https_port: int) -> dict[str, Any]:
@@ -204,6 +254,23 @@ def probe_route(hostname: str, upstream: str, root_pem: bytes, https_port: int) 
         message = f"system TLS verification failed for {hostname}: {exc}"
         result["errors"]["system_trust"] = str(exc)
         result["problems"].append(message)
+    result["python_ca_trusted"] = result["system_trusted"]
+    result["errors"]["python_ca"] = result["errors"]["system_trust"]
+    if platform.system() == "Darwin":
+        python_problems = [
+            problem
+            for problem in result["problems"]
+            if problem.startswith("system TLS verification failed")
+        ]
+        result["problems"] = [p for p in result["problems"] if p not in python_problems]
+        result["warnings"].extend(
+            problem.replace("system TLS", "Python CA-bundle TLS") for problem in python_problems
+        )
+        trusted, error = _macos_verify_chain(hostname, [bytes(cert) for cert in chain])
+        result["system_trusted"] = trusted
+        result["errors"]["system_trust"] = error
+        if not trusted:
+            result["problems"].append(f"macOS TLS verification failed for {hostname}: {error}")
     return result
 
 
@@ -215,20 +282,41 @@ class TrustInspector:
         system_anchor_path: Path | str | None = None,
         system_store_paths: Iterable[Path | str] | None = None,
         route_probe: RouteProbe = probe_route,
+        platform_name: str | None = None,
+        system_store_contains: StoreContains | None = None,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
         self.caddy = caddy
-        self.system_anchor_path = Path(
-            system_anchor_path
-            or os.environ.get(
-                "YAN_PORT_SYSTEM_CA_ANCHOR",
-                "/usr/local/share/ca-certificates/yan-port-local-root.crt",
+        self.platform_name = platform_name or platform.system()
+        default_anchor = "/usr/local/share/ca-certificates/yan-port-local-root.crt"
+        if self.platform_name == "Darwin":
+            state_root = Path(
+                os.environ.get(
+                    "YAN_PORT_STATE_HOME",
+                    Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+                    / "yan-port",
+                )
             )
+            default_anchor = str(state_root / "trust" / "yan-port-local-root.crt")
+        self.system_anchor_path = Path(
+            system_anchor_path or os.environ.get("YAN_PORT_SYSTEM_CA_ANCHOR", default_anchor)
         )
         configured_paths = (
             system_store_paths if system_store_paths is not None else _default_system_store_paths()
         )
         self.system_store_paths = tuple(Path(path) for path in configured_paths)
         self.route_probe = route_probe
+        self.runner = runner
+        if system_store_contains is not None:
+            self.system_store_contains = system_store_contains
+        elif self.platform_name == "Darwin" and system_store_paths is None:
+            self.system_store_contains = lambda fingerprint: _macos_keychain_contains(
+                fingerprint, runner=self.runner
+            )
+        else:
+            self.system_store_contains = lambda fingerprint: _store_contains(
+                fingerprint, self.system_store_paths
+            )
 
     @staticmethod
     def _routes(registry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -288,7 +376,7 @@ class TrustInspector:
 
         root_details = {
             "path": str(self.caddy.root_ca_path),
-            "source": "caddy_admin_api",
+            "source": getattr(self.caddy, "root_ca_source", "caddy_admin_api"),
             "available": False,
             "sha256": None,
         }
@@ -335,7 +423,7 @@ class TrustInspector:
             except TrustError:
                 problems.append(f"system CA anchor is malformed: {self.system_anchor_path}")
 
-        installed = _store_contains(active_sha256, self.system_store_paths)
+        installed = self.system_store_contains(active_sha256)
         system_details["installed"] = installed
         if not installed:
             problems.append("system trust store does not contain the active root CA")
@@ -367,6 +455,61 @@ class TrustInspector:
             "warnings": warnings,
             "problems": problems,
         }
+
+    def install(self, registry: dict[str, Any]) -> dict[str, Any]:
+        if self.platform_name != "Darwin":
+            raise TrustError(
+                "automatic trust installation is available on macOS; use the documented "
+                "Linux system trust workflow"
+            )
+        self.system_anchor_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        exported = self.export(registry, self.system_anchor_path)
+        if not exported["changed"] and self.status(registry)["ok"]:
+            return {"changed": False, "sha256": exported["sha256"], "keychain": "system"}
+        result = self.runner(
+            [
+                "sudo",
+                "/usr/bin/security",
+                "add-trusted-cert",
+                "-d",
+                "-r",
+                "trustRoot",
+                "-k",
+                "/Library/Keychains/System.keychain",
+                str(self.system_anchor_path),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if result.returncode != 0:
+            raise TrustError(result.stdout.strip() or "macOS trust installation failed")
+        return {"changed": True, "sha256": exported["sha256"], "keychain": "system"}
+
+    def remove(self, registry: dict[str, Any]) -> dict[str, Any]:
+        if self.platform_name != "Darwin":
+            raise TrustError("automatic trust removal is available only on macOS")
+        _root_pem, root = self._active_root()
+        fingerprint = certificate_sha256(root).upper()
+        result = self.runner(
+            [
+                "sudo",
+                "/usr/bin/security",
+                "delete-certificate",
+                "-Z",
+                fingerprint,
+                "/Library/Keychains/System.keychain",
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if result.returncode != 0:
+            raise TrustError(result.stdout.strip() or "macOS trust removal failed")
+        self.system_anchor_path.unlink(missing_ok=True)
+        return {"changed": True, "sha256": fingerprint.lower(), "keychain": "system"}
 
     def export(
         self, registry: dict[str, Any], output: Path | str, *, force: bool = False

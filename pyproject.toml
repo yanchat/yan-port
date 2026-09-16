@@ -20,6 +20,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/yan_port"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"scripts" = "yan_port/native/scripts"
+"deploy" = "yan_port/native/deploy"
+
 [dependency-groups]
 dev = [
   "pytest>=8.4.0",

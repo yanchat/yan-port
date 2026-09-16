@@ -24,6 +24,24 @@ lint:
 doctor:
 	uv run yan-port doctor
 
+router-install:
+	uv run yan-port router install
+
+router-start:
+	uv run yan-port router start
+
+router-stop:
+	uv run yan-port router stop
+
+router-uninstall *args:
+	uv run yan-port router uninstall {{args}}
+
+trust-install:
+	uv run yan-port trust install
+
+trust-remove:
+	uv run yan-port trust remove --yes
+
 install-caddy:
 	sudo scripts/install-caddy-binary.sh
 

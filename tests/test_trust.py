@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import socket
 import ssl
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any
@@ -519,8 +520,187 @@ def test_export_refuses_symlink_and_empty_registry(tmp_path: Path) -> None:
             ),
             link,
         )
+
+
+def test_macos_keychain_presence_does_not_override_failed_verification(tmp_path: Path) -> None:
+    root = make_ca()
+    anchor = tmp_path / "root.crt"
+    anchor.write_bytes(root)
+
+    def python_bundle_misses_root(
+        hostname: str, upstream: str, root_pem: bytes, https_port: int
+    ) -> dict[str, Any]:
+        payload = healthy_route_probe(hostname, upstream, root_pem, https_port)
+        payload["system_trusted"] = False
+        payload["errors"] = {"system_trust": "Python bundle does not use Keychain"}
+        payload["problems"] = ["system TLS verification failed for studio.example.localhost"]
+        return payload
+
+    caddy = FakeCaddy(root)
+    caddy.root_ca_source = "docker_container"
+    inspector = TrustInspector(
+        caddy,
+        system_anchor_path=anchor,
+        route_probe=python_bundle_misses_root,
+        platform_name="Darwin",
+        system_store_contains=lambda _fingerprint: True,
+    )
+
+    payload = inspector.status(
+        registry(
+            {
+                "service": "studio",
+                "hostname": "studio.example.localhost",
+                "upstream": "http://127.0.0.1:29734",
+            }
+        )
+    )
+
+    assert payload["ok"] is False
+    assert payload["root_ca"]["source"] == "docker_container"
+    assert payload["routes"][0]["system_trusted"] is False
+    assert payload["routes"][0]["errors"]["system_trust"] is not None
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_macos_native_verification_uses_ssl_policy_without_injected_root(returncode: int) -> None:
+    from yan_port.trust import _macos_verify_chain
+
+    files = []
+
+    def runner(command, **kwargs):
+        assert command[:4] == ["/usr/bin/security", "verify-cert", "-L", "-p"]
+        assert "ssl" in command and "studio.example.localhost" in command
+        assert "-r" not in command
+        files.extend(Path(command[i + 1]) for i, value in enumerate(command) if value == "-c")
+        assert [path.read_bytes() for path in files] == [b"leaf", b"intermediate"]
+        return subprocess.CompletedProcess(
+            command, returncode, "", "rejected" if returncode else ""
+        )
+
+    trusted, error = _macos_verify_chain(
+        "studio.example.localhost", [b"leaf", b"intermediate"], runner=runner
+    )
+    assert trusted is (returncode == 0)
+    assert (error is None) is trusted
+    assert all(not path.exists() for path in files)
+
+
+def test_macos_trust_install_exports_exact_root_and_calls_security(tmp_path: Path) -> None:
+    root = make_ca()
+    commands: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    anchor = tmp_path / "trust" / "root.crt"
+    inspector = TrustInspector(
+        FakeCaddy(root),
+        system_anchor_path=anchor,
+        platform_name="Darwin",
+        system_store_contains=lambda _fingerprint: False,
+        runner=runner,
+    )
+
+    payload = inspector.install(
+        registry(
+            {
+                "service": "studio",
+                "hostname": "studio.example.localhost",
+                "upstream": "http://127.0.0.1:29734",
+            }
+        )
+    )
+
+    assert anchor.read_bytes() == root
+    assert payload["keychain"] == "system"
+    assert commands[0][:3] == ["sudo", "/usr/bin/security", "add-trusted-cert"]
     with pytest.raises(TrustError, match="no HTTPS routes"):
         inspector.export(registry(), tmp_path / "unused.crt")
+
+
+@pytest.mark.parametrize("conflict", ["certificate", "appended", "symlink"])
+def test_macos_trust_install_preserves_conflicting_anchor(tmp_path: Path, conflict: str) -> None:
+    root = make_ca("Active")
+    anchor = tmp_path / "root.crt"
+    original = make_ca("Existing") if conflict == "certificate" else root + b"extra\n"
+    if conflict == "symlink":
+        target = tmp_path / "other.crt"
+        target.write_bytes(original)
+        anchor.symlink_to(target)
+    else:
+        anchor.write_bytes(original)
+    calls = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    inspector = TrustInspector(
+        FakeCaddy(root),
+        system_anchor_path=anchor,
+        platform_name="Darwin",
+        runner=runner,
+    )
+    with pytest.raises(TrustError):
+        inspector.install(
+            registry(
+                {
+                    "service": "studio",
+                    "hostname": "studio.example.localhost",
+                    "upstream": "http://127.0.0.1:29734",
+                }
+            )
+        )
+    assert anchor.read_bytes() == original
+    assert anchor.is_symlink() == (conflict == "symlink")
+    assert calls == []
+
+
+@pytest.mark.parametrize("effective_trust", [True, False])
+def test_macos_trust_install_reuses_only_effectively_trusted_root(
+    tmp_path: Path,
+    effective_trust: bool,
+) -> None:
+    root = make_ca()
+    anchor = tmp_path / "root.crt"
+    anchor.write_bytes(root)
+    before = anchor.stat()
+    calls = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    def probe(*args):
+        result = healthy_route_probe(*args)
+        if not effective_trust:
+            result["system_trusted"] = False
+            result["problems"] = ["Keychain denied certificate trust"]
+        return result
+
+    inspector = TrustInspector(
+        FakeCaddy(root),
+        system_anchor_path=anchor,
+        platform_name="Darwin",
+        system_store_contains=lambda _fingerprint: True,
+        route_probe=probe,
+        runner=runner,
+    )
+    result = inspector.install(
+        registry(
+            {
+                "service": "studio",
+                "hostname": "studio.example.localhost",
+                "upstream": "http://127.0.0.1:29734",
+            }
+        )
+    )
+    assert result["changed"] is not effective_trust
+    assert len(calls) == (0 if effective_trust else 1)
+    assert anchor.read_bytes() == root
+    assert anchor.stat().st_ino == before.st_ino
 
 
 def test_export_does_not_accept_matching_certificate_with_appended_content(

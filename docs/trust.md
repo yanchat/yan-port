@@ -75,8 +75,18 @@ yan-port trust status
 ```
 
 System-trust inspection and repair support the Debian-style Linux layout used
-by YanPort's native-Caddy deployment; macOS and Windows trust stores are
-unsupported.
+by YanPort's native-Caddy deployment. On macOS, `yan-port trust install`
+exports the exact active Docker Caddy root and installs it into System Keychain;
+`yan-port trust remove --yes` removes that exact fingerprint. Windows trust
+stores remain unsupported.
+
+macOS installation preserves an existing differing anchor instead of replacing
+it before authentication. Inspect both fingerprints and resolve stale content
+explicitly before retrying; `trust export --force --output PATH` is the separate
+opt-in replacement operation. An exact existing anchor is reused without sudo
+only when route inspection also verifies effective system trust. Certificate
+presence alone does not establish trust. After an installation, run `trust status`
+to verify the result; a successful import command alone is not a readiness check.
 
 ## Chrome and Chromium
 

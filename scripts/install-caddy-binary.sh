@@ -45,6 +45,12 @@ if [[ "${install_dir}" == "/usr/local/bin" && "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
+destination="${install_dir}/caddy"
+if [[ -L "$destination" || ( -e "$destination" && ! -f "$destination" ) ]]; then
+  printf 'Existing Caddy destination needs explicit repair: %s\n' "$destination" >&2
+  exit 1
+fi
+
 caddy_tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "${caddy_tmp_dir}"' EXIT
 
@@ -54,6 +60,15 @@ printf '%s  %s\n' "${caddy_sha512}" "${caddy_tmp_dir}/${caddy_archive}" | sha512
 tar --extract --gzip --file "${caddy_tmp_dir}/${caddy_archive}" \
   --directory "${caddy_tmp_dir}" caddy
 "${caddy_tmp_dir}/caddy" version | grep --fixed-strings --quiet "v${caddy_version}"
+
+if [[ -e "$destination" ]]; then
+  if [[ -x "$destination" ]] && cmp -s "$destination" "${caddy_tmp_dir}/caddy"; then
+    printf 'Reusing verified Caddy binary: %s\n' "$destination"
+    exit 0
+  fi
+  printf 'Existing Caddy differs from the verified pin; preserve it and resolve explicitly: %s\n' "$destination" >&2
+  exit 1
+fi
 
 install -d -m 0755 "${install_dir}"
 if [[ "${EUID}" -eq 0 ]]; then

@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 
-from .caddy import CaddyController, render_caddyfile
+from .caddy import create_caddy_controller, render_caddyfile
 from .errors import YanPortError
 from .registry import StateStore
 from .service import YanPortService
+
+_SYSTEMD_RUNTIME = Path("/run/systemd/system")
 
 app = typer.Typer(help="Ownership-safe local routing and worktree isolation.", no_args_is_help=True)
 context_app = typer.Typer(help="Inspect and establish checkout identity.", no_args_is_help=True)
@@ -32,7 +38,7 @@ app.add_typer(trust_app, name="trust")
 
 def _service() -> YanPortService:
     store = StateStore()
-    return YanPortService(store, CaddyController())
+    return YanPortService(store, create_caddy_controller())
 
 
 def _emit(payload: Any, *, as_json: bool = False, plain_key: str | None = None) -> None:
@@ -328,6 +334,31 @@ def trust_export(
             typer.echo(f"Replaced SHA-256: {_format_fingerprint(payload['replaced_sha256'])}")
 
 
+@trust_app.command("install")
+def trust_install(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Install the active YanPort root in macOS System Keychain."""
+    _emit(_run(lambda: _service().trust_install()), as_json=json_output)
+
+
+@trust_app.command("remove")
+def trust_remove(
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Confirm removal of the exact active root CA.")
+    ] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON.")
+    ] = False,
+) -> None:
+    if not yes:
+        typer.echo("error: pass --yes to remove the active YanPort root CA", err=True)
+        raise typer.Exit(1)
+    _emit(_run(lambda: _service().trust_remove()), as_json=json_output)
+
+
 @router_app.command("render")
 def router_render(
     http_port: Annotated[int, typer.Option(help="HTTP listener port.")] = 80,
@@ -337,6 +368,20 @@ def router_render(
     ] = None,
 ) -> None:
     service = _service()
+    if service.caddy.driver == "docker":
+        if admin_socket is not None:
+            raise typer.BadParameter("--admin-socket is available only for the native driver")
+        service.caddy.http_port = http_port
+        service.caddy.https_port = https_port
+        typer.echo(service.caddy.render(service.status()), nl=False)
+        return
+    if (
+        admin_socket is None
+        and http_port == service.caddy.http_port
+        and https_port == service.caddy.https_port
+    ):
+        typer.echo(service.caddy.render(service.status()), nl=False)
+        return
     typer.echo(
         render_caddyfile(
             service.status(),
@@ -370,11 +415,155 @@ def router_status(
         bool, typer.Option("--json", help="Emit machine-readable JSON.")
     ] = False,
 ) -> None:
+    caddy = _service().caddy
     payload = {
-        "service": "yan-port-caddy.service",
-        "state": _run(lambda: _service().caddy.status()),
+        "driver": caddy.driver,
+        "service": caddy.service_name,
+        "state": _run(caddy.status),
     }
     _emit(payload, as_json=json_output)
+
+
+def _docker_router_operation(name: str, **kwargs: Any) -> dict[str, Any]:
+    caddy = _service().caddy
+    operation = getattr(caddy, name, None)
+    if not callable(operation):
+        raise RuntimeError(
+            "Router lifecycle commands are available for the Docker driver; "
+            "use the reviewed native service scripts on Linux"
+        )
+    return operation(**kwargs)
+
+
+@router_app.command("install")
+def router_install(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Install or start the ownership-labeled Docker router."""
+    _emit(_run(lambda: _docker_router_operation("install")), as_json=json_output)
+
+
+def _run_native_scripts(*, activate: bool = False) -> None:
+    if platform.system() != "Linux" or platform.machine() not in {"x86_64", "amd64"}:
+        raise RuntimeError("Native provisioning requires x86-64 Linux")
+    if os.geteuid() == 0:
+        raise RuntimeError("Run YanPort as the developer; the installers request sudo separately")
+    if not _SYSTEMD_RUNTIME.is_dir():
+        raise RuntimeError("Native provisioning requires running systemd")
+    required = ("sudo", "curl", "tar", "sha512sum", "cmp", "systemctl", "getent", "stat")
+    missing = [command for command in required if shutil.which(command) is None]
+    if missing:
+        raise RuntimeError("Missing native prerequisites: " + ", ".join(missing))
+    assets = Path(__file__).parent / "native"
+    if not assets.is_dir():
+        assets = Path(__file__).resolve().parents[2]
+    required_files = (
+        "scripts/install-service.sh",
+        "scripts/install-caddy-binary.sh",
+        "scripts/activate-service.sh",
+        "deploy/bootstrap.Caddyfile",
+        "deploy/yan-port-caddy.service",
+        "deploy/yan-port-caddy-cutover.service",
+    )
+    if not all((assets / name).is_file() for name in required_files):
+        raise RuntimeError(
+            "Native installation assets are missing; reinstall a complete YanPort package"
+        )
+    commands = (
+        ["sudo", "--", "/bin/bash", str(assets / "scripts/install-service.sh"), "--check"],
+        ["sudo", "--", "/bin/bash", str(assets / "scripts/install-caddy-binary.sh")],
+        ["sudo", "--", "/bin/bash", str(assets / "scripts/install-service.sh")],
+    )
+    if activate:
+        commands = (
+            ["sudo", "--", "/bin/bash", str(assets / "scripts/activate-service.sh"), "--yes"],
+        )
+    try:
+        for command in commands:
+            subprocess.run(command, check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "Native operation stopped; inspect the script error before retrying"
+        ) from exc
+
+
+@router_app.command("provision-native")
+def router_provision_native(
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Approve native binary, account and unit installation.")
+    ] = False,
+) -> None:
+    """Provision the native Linux router without starting it or taking over ports."""
+    if not yes:
+        typer.echo(
+            "error: pass --yes to approve native provisioning and sudo authentication", err=True
+        )
+        raise typer.Exit(1)
+    _run(_run_native_scripts)
+    typer.echo(
+        "Native router provisioned but not started. Re-login for group membership, "
+        "then follow the activation procedure."
+    )
+
+
+@router_app.command("activate-native")
+def router_activate_native(
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Approve starting and enabling the fresh native bootstrap."),
+    ] = False,
+) -> None:
+    """Activate only an unchanged native bootstrap, preserving prior state on failure."""
+    if not yes:
+        typer.echo(
+            "error: pass --yes to approve native activation and sudo authentication", err=True
+        )
+        raise typer.Exit(1)
+    _run(lambda: _run_native_scripts(activate=True))
+
+
+@router_app.command("start")
+def router_start(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON.")
+    ] = False,
+) -> None:
+    _emit(_run(lambda: _docker_router_operation("start")), as_json=json_output)
+
+
+@router_app.command("stop")
+def router_stop(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON.")
+    ] = False,
+) -> None:
+    _emit(_run(lambda: _docker_router_operation("stop")), as_json=json_output)
+
+
+@router_app.command("uninstall")
+def router_uninstall(
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Confirm removal of the managed router container.")
+    ] = False,
+    purge_data: Annotated[
+        bool,
+        typer.Option(
+            "--purge-data", help="Also delete the router's named volume and local CA data."
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON.")
+    ] = False,
+) -> None:
+    if not yes:
+        typer.echo("error: pass --yes to remove the YanPort router", err=True)
+        raise typer.Exit(1)
+    _emit(
+        _run(lambda: _docker_router_operation("uninstall", purge_data=purge_data)),
+        as_json=json_output,
+    )
 
 
 def main() -> None:

@@ -576,6 +576,12 @@ class YanPortService:
     def trust_export(self, output: Path | str, *, force: bool = False) -> dict[str, Any]:
         return self.trust.export(self.status(), output, force=force)
 
+    def trust_install(self) -> dict[str, Any]:
+        return self.trust.install(self.status())
+
+    def trust_remove(self) -> dict[str, Any]:
+        return self.trust.remove(self.status())
+
     def doctor(self) -> dict[str, Any]:
         with self.store.lock():
             registry = self.store.clone(self.store.load())
