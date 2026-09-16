@@ -106,7 +106,7 @@ def test_install_refuses_foreign_existing_container(tmp_path: Path) -> None:
         controller.install()
 
 
-def test_apply_validates_reloads_candidate_then_commits(tmp_path: Path) -> None:
+def test_apply_validates_reloads_candidate_then_commits(tmp_path: Path, monkeypatch) -> None:
     config_dir = tmp_path / "router"
     config_dir.mkdir()
     config = config_dir / "Caddyfile"
@@ -114,24 +114,22 @@ def test_apply_validates_reloads_candidate_then_commits(tmp_path: Path) -> None:
     runner = RecordingRunner(
         [
             completed([]),
-            completed(
-                [], output=f"true|running|{DockerCaddyController(state_path=tmp_path).image}"
-            ),
             completed([]),
         ]
     )
     controller = DockerCaddyController(state_path=tmp_path, runner=runner)
+    monkeypatch.setattr(controller, "status", lambda: "running")
 
     controller.apply("new\n")
 
     assert config.read_text() == "new\n"
     assert runner.commands[0][:3] == ["docker", "run", "--rm"]
-    reload_command = runner.commands[2]
+    reload_command = runner.commands[1]
     assert reload_command[:4] == ["docker", "exec", "yan-port-caddy", "caddy"]
     assert any(part.startswith("/config/.") for part in reload_command)
 
 
-def test_apply_preserves_config_when_reload_fails(tmp_path: Path) -> None:
+def test_apply_preserves_config_when_reload_fails(tmp_path: Path, monkeypatch) -> None:
     config_dir = tmp_path / "router"
     config_dir.mkdir()
     config = config_dir / "Caddyfile"
@@ -139,13 +137,11 @@ def test_apply_preserves_config_when_reload_fails(tmp_path: Path) -> None:
     runner = RecordingRunner(
         [
             completed([]),
-            completed(
-                [], output=f"true|running|{DockerCaddyController(state_path=tmp_path).image}"
-            ),
             completed([], 1, "reload failed"),
         ]
     )
     controller = DockerCaddyController(state_path=tmp_path, runner=runner)
+    monkeypatch.setattr(controller, "status", lambda: "running")
 
     with pytest.raises(CaddyError, match="reload failed"):
         controller.apply("new\n")
@@ -153,10 +149,13 @@ def test_apply_preserves_config_when_reload_fails(tmp_path: Path) -> None:
     assert config.read_text() == "old\n"
 
 
-def test_fetch_root_certificate_reads_public_root_from_container(tmp_path: Path) -> None:
+def test_fetch_root_certificate_reads_public_root_from_container(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"
     runner = RecordingRunner([completed([], output=root)])
     controller = DockerCaddyController(state_path=tmp_path, runner=runner)
+    monkeypatch.setattr(controller, "status", lambda: "running")
 
     assert controller.fetch_root_certificate() == root.encode()
     assert runner.commands == [
@@ -194,7 +193,10 @@ def test_daemon_failure_is_not_missing_router(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("missing", [False, True])
-def test_status_refuses_missing_or_foreign_certificate_volume(tmp_path, monkeypatch, missing):
+@pytest.mark.parametrize("operation", ["status", "apply", "fetch_root_certificate"])
+def test_status_refuses_missing_or_foreign_certificate_volume(
+    tmp_path, monkeypatch, missing, operation
+):
     runner = RecordingRunner(
         [
             completed([], 1, "No such volume") if missing else completed([], output="false"),
@@ -206,8 +208,21 @@ def test_status_refuses_missing_or_foreign_certificate_volume(tmp_path, monkeypa
     )
     monkeypatch.setattr(controller, "_validate_container_contract", lambda: None)
     with pytest.raises(CaddyError, match="volume is missing" if missing else "not owned"):
-        controller.status()
+        getattr(controller, operation)(*("new\n",) if operation == "apply" else ())
     assert all(command[:3] == ["docker", "volume", "inspect"] for command in runner.commands)
+
+
+@pytest.mark.parametrize("state", ["not-installed", "exited", "paused"])
+@pytest.mark.parametrize("operation", ["apply", "fetch_root_certificate"])
+def test_reload_and_certificate_export_require_running_router(
+    tmp_path, monkeypatch, state, operation
+):
+    runner = RecordingRunner()
+    controller = DockerCaddyController(state_path=tmp_path, runner=runner)
+    monkeypatch.setattr(controller, "status", lambda: state)
+    with pytest.raises(CaddyError, match="not running"):
+        getattr(controller, operation)(*("new\n",) if operation == "apply" else ())
+    assert runner.commands == []
 
 
 @pytest.mark.parametrize("status", ["running", "exited", "created", "dead"])
@@ -240,7 +255,10 @@ def test_router_lifecycle_refuses_configuration_drift(tmp_path: Path, operation:
     assert all(command[1] == "inspect" for command in runner.commands)
 
 
-@pytest.mark.parametrize("operation", ["install", "start", "stop", "uninstall", "status"])
+@pytest.mark.parametrize(
+    "operation",
+    ["install", "start", "stop", "uninstall", "status", "apply", "fetch_root_certificate"],
+)
 @pytest.mark.parametrize("drift", [None, "image", "driver", "mount", "readonly"])
 def test_lifecycle_accepts_only_complete_owned_contract(
     tmp_path: Path, operation: str, drift
@@ -283,18 +301,27 @@ def test_lifecycle_accepts_only_complete_owned_contract(
     if operation == "install":
         responses.append(completed([], output="true"))
     responses.append(completed([], output=json.dumps([details])))
-    if operation in {"start", "status"}:
+    if operation in {"start", "status", "apply", "fetch_root_certificate"}:
         responses.append(completed([], output="true"))
+    if operation == "fetch_root_certificate":
+        responses.append(completed([], output="-----BEGIN CERTIFICATE-----\ntest\n"))
     runner = RecordingRunner(responses)
     controller.runner = runner
+    arguments = ("new\n",) if operation == "apply" else ()
     if drift:
         with pytest.raises(CaddyError, match="configuration differs"):
-            getattr(controller, operation)()
-        assert not any(command[1] in {"start", "stop", "rm", "run"} for command in runner.commands)
+            getattr(controller, operation)(*arguments)
+        assert not any(
+            command[1] in {"start", "stop", "rm", "run", "exec"} for command in runner.commands
+        )
     else:
-        result = getattr(controller, operation)()
+        result = getattr(controller, operation)(*arguments)
         if operation == "status":
             assert result == "running"
+        elif operation == "apply":
+            assert controller.config_path.read_text() == "new\n"
+        elif operation == "fetch_root_certificate":
+            assert result.startswith(b"-----BEGIN CERTIFICATE-----")
         else:
             assert result["changed"] == (operation in {"stop", "uninstall"})
 

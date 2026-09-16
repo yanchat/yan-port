@@ -142,11 +142,13 @@ and reaches host-run development processes through `host.docker.internal`.
 Registry routes remain canonical loopback origins; translation happens only in
 the rendered Docker Caddy configuration.
 
-Install, start, stop and uninstall validate the existing container's image,
-ownership labels, loopback ports, restart policy and mounts before mutation.
+Install, start, stop, uninstall, reload and certificate export validate the
+existing container's image, ownership labels, loopback ports, restart policy and
+mounts before acting.
 Configuration drift requires inspection; even a failed container is not removed
-automatically when its configuration differs. Start also verifies ownership of
-the certificate volume. These checks do not authorize replacing other workloads.
+automatically when its configuration differs. Start, reload and certificate
+export also verify ownership of the certificate volume. These checks do not
+authorize replacing other workloads.
 
 After an application registers the first HTTPS route, install the exact active
 root into macOS System Keychain:

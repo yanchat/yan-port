@@ -516,10 +516,9 @@ class DockerCaddyController(CaddyController):
         return {"changed": True, "status": "running"}
 
     def apply(self, content: str) -> None:
-        self.validate(content)
-        exists, status, _image = self._container_details()
-        if not exists or status != "running":
+        if self.status() != "running":
             raise CaddyError("YanPort Docker router is not running; run `yan-port router install`")
+        self.validate(content)
         self.router_path.mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.NamedTemporaryFile(
             mode="w", prefix=".Caddyfile.tmp-", dir=self.router_path, delete=False
@@ -592,6 +591,8 @@ class DockerCaddyController(CaddyController):
         return {"changed": exists or volume_exists, "data_preserved": not purge_data}
 
     def fetch_root_certificate(self) -> bytes:
+        if self.status() != "running":
+            raise CaddyError("YanPort Docker router is not running; run `yan-port router install`")
         result = self._run(
             [
                 "docker",
