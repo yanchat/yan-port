@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -127,6 +129,7 @@ def test_apply_validates_reloads_candidate_then_commits(tmp_path: Path, monkeypa
     reload_command = runner.commands[1]
     assert reload_command[:4] == ["docker", "exec", "yan-port-caddy", "caddy"]
     assert any(part.startswith("/config/.") for part in reload_command)
+    assert not list(config_dir.glob(".reload-*"))
 
 
 def test_apply_preserves_config_when_reload_fails(tmp_path: Path, monkeypatch) -> None:
@@ -147,6 +150,7 @@ def test_apply_preserves_config_when_reload_fails(tmp_path: Path, monkeypatch) -
         controller.apply("new\n")
 
     assert config.read_text() == "old\n"
+    assert not list(config_dir.glob(".reload-*"))
 
 
 def test_fetch_root_certificate_reads_public_root_from_container(
@@ -167,6 +171,59 @@ def test_fetch_root_certificate_reads_public_root_from_container(
             "/data/caddy/pki/authorities/local/root.crt",
         ]
     ]
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+@pytest.mark.parametrize("failure", ["replace", "sync"])
+def test_persistence_failure_restores_previous_live_configuration(
+    tmp_path, monkeypatch, rollback_fails, failure
+):
+    controller = DockerCaddyController(state_path=tmp_path)
+    controller.router_path.mkdir()
+    controller.config_path.write_text("old\n")
+    monkeypatch.setattr(controller, "status", lambda: "running")
+    monkeypatch.setattr(controller, "validate", lambda content: None)
+    live = []
+
+    def run(command, **kwargs):
+        content = (
+            controller.router_path / command[command.index("--config") + 1].removeprefix("/config/")
+        ).read_text()
+        if rollback_fails and content == "old\n":
+            return completed(command, 1, "rollback rejected")
+        live.append(content)
+        return completed(command)
+
+    controller.runner = run
+    replace = Path.replace
+
+    def fail_candidate(path, target):
+        if failure == "replace" and path.read_text() == "new\n":
+            raise OSError("disk failure")
+        return replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_candidate)
+    fsync = os.fsync
+    failed_sync = False
+
+    def fail_directory_sync(fd):
+        nonlocal failed_sync
+        if failure == "sync" and not failed_sync and stat.S_ISDIR(os.fstat(fd).st_mode):
+            failed_sync = True
+            raise OSError("directory sync failed")
+        return fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_sync)
+    with pytest.raises(CaddyError, match="rollback failed" if rollback_fails else "restored"):
+        controller.apply("new\n")
+    assert controller.config_path.read_text() == (
+        "new\n" if failure == "sync" and rollback_fails else "old\n"
+    )
+    assert live == (["new\n"] if rollback_fails else ["new\n", "old\n"])
+    staging = list(controller.router_path.glob(".reload-*"))
+    assert bool(staging) is rollback_fails
+    if rollback_fails:
+        assert (staging[0] / "previous").read_text() == "old\n"
 
 
 @pytest.mark.parametrize("operation", ["install", "uninstall"])
@@ -307,6 +364,9 @@ def test_lifecycle_accepts_only_complete_owned_contract(
         responses.append(completed([], output="-----BEGIN CERTIFICATE-----\ntest\n"))
     runner = RecordingRunner(responses)
     controller.runner = runner
+    if operation == "apply":
+        controller.router_path.mkdir()
+        controller.config_path.write_text("old\n")
     arguments = ("new\n",) if operation == "apply" else ()
     if drift:
         with pytest.raises(CaddyError, match="configuration differs"):

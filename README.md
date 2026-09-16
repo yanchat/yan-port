@@ -156,6 +156,13 @@ automatically when its configuration differs. Start, reload and certificate
 export also verify ownership of the certificate volume. These checks do not
 authorize replacing other workloads.
 
+Reload prepares the candidate and previous configuration before changing Caddy.
+If saving the accepted candidate fails, it restores the previous live and disk
+configuration. If rollback also fails, the command reports failure and retains
+the `.reload-*` recovery directory for inspection; do not retry blindly. Successful
+reloads and successful rollback remove temporary files. This handles reported
+I/O failures, not an atomic guarantee across a process or machine crash.
+
 After an application registers the first HTTPS route, install the exact active
 root into macOS System Keychain:
 

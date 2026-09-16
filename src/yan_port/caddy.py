@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -519,37 +520,62 @@ class DockerCaddyController(CaddyController):
         if self.status() != "running":
             raise CaddyError("YanPort Docker router is not running; run `yan-port router install`")
         self.validate(content)
-        self.router_path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with tempfile.NamedTemporaryFile(
-            mode="w", prefix=".Caddyfile.tmp-", dir=self.router_path, delete=False
-        ) as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-            candidate = Path(handle.name)
+        previous = self.config_path.read_bytes()
+        staging = Path(tempfile.mkdtemp(prefix=".reload-", dir=self.router_path))
+        candidate = staging / "candidate"
+        backup = staging / "previous"
+        preserve_backup = False
         try:
-            self._run(
-                [
-                    "docker",
-                    "exec",
-                    self.container_name,
-                    "caddy",
-                    "reload",
-                    "--config",
-                    f"/config/{candidate.name}",
-                    "--adapter",
-                    "caddyfile",
-                ]
-            )
-            candidate.chmod(0o600)
-            candidate.replace(self.config_path)
+            for path, data in ((candidate, content.encode()), (backup, previous)):
+                with path.open("xb") as handle:
+                    path.chmod(0o600)
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
             directory = os.open(self.router_path, os.O_RDONLY)
             try:
-                os.fsync(directory)
+                self._reload_path(candidate)
+                try:
+                    candidate.replace(self.config_path)
+                    os.fsync(directory)
+                except OSError as exc:
+                    try:
+                        self._reload_path(backup)
+                        shutil.copyfile(backup, candidate)
+                        with candidate.open("rb") as handle:
+                            os.fsync(handle.fileno())
+                        candidate.replace(self.config_path)
+                        os.fsync(directory)
+                    except (OSError, CaddyError) as rollback:
+                        preserve_backup = True
+                        raise CaddyError(
+                            f"Configuration persistence failed ({exc}); "
+                            f"rollback failed ({rollback}). "
+                            f"Inspect {staging} and the live router before retrying."
+                        ) from rollback
+                    raise CaddyError(
+                        f"Configuration persistence failed; previous configuration restored: {exc}"
+                    ) from exc
             finally:
                 os.close(directory)
         finally:
-            candidate.unlink(missing_ok=True)
+            if not preserve_backup:
+                shutil.rmtree(staging)
+
+    def _reload_path(self, path: Path) -> None:
+        self._run(
+            [
+                "docker",
+                "exec",
+                self.container_name,
+                "caddy",
+                "reload",
+                "--config",
+                f"/config/{path.relative_to(self.router_path).as_posix()}",
+                "--adapter",
+                "caddyfile",
+            ]
+        )
 
     def status(self) -> str:
         exists, status, _image = self._container_details()
