@@ -54,6 +54,12 @@ assets (or the same source files in an editable checkout), checks prerequisites
 and service conflicts, and requests sudo only for the existing installers.
 Live Linux provisioning acceptance remains outstanding.
 
+`yan-port version --json` reports the package version and installer-recorded
+source metadata without contacting the router. Git installations report their
+commit; editable installations report their source directory. Missing metadata
+is reported as null, not inferred from the current directory or package version.
+This is an installation diagnostic, not tamper-proof release attestation.
+
 ## Native Caddy
 
 YanPort pins the reviewed official Caddy 2.11.4 Linux amd64 release by SHA-512.

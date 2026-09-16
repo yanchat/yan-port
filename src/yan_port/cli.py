@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 import subprocess
+from importlib.metadata import distribution
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -39,6 +40,19 @@ app.add_typer(trust_app, name="trust")
 def _service() -> YanPortService:
     store = StateStore()
     return YanPortService(store, create_caddy_controller())
+
+
+@app.command("version")
+def version(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit installed source metadata.")
+    ] = False,
+) -> None:
+    """Report package version and installer-recorded source without contacting the router."""
+    package = distribution("yan-port")
+    source = package.read_text("direct_url.json")
+    payload = {"version": package.version, "source": json.loads(source) if source else None}
+    _emit(payload, as_json=json_output, plain_key="version")
 
 
 def _emit(payload: Any, *, as_json: bool = False, plain_key: str | None = None) -> None:

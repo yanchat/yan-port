@@ -14,6 +14,36 @@ runner = CliRunner()
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        None,
+        {"url": "file:///source", "dir_info": {"editable": True}},
+        {
+            "url": "https://github.com/yanchat/yan-port.git",
+            "vcs_info": {"vcs": "git", "commit_id": "a" * 40},
+        },
+    ],
+)
+def test_version_reports_installed_metadata_without_router(monkeypatch, source):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        cli,
+        "distribution",
+        lambda name: SimpleNamespace(
+            version="0.1.0",
+            read_text=lambda filename: json.dumps(source) if source is not None else None,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(cli, "_service", lambda: pytest.fail("version touched router"))
+    result = runner.invoke(app, ["version", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload == {"version": "0.1.0", "source": source}
+
+
+@pytest.mark.parametrize(
     "command,failure",
     [
         ("provision-native", None),
