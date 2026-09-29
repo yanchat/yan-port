@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .errors import CaddyError
+from .errors import CaddyError, CaddyRecoveryError
 
 _HOSTNAME = re.compile(r"(?=^.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+localhost$")
 
@@ -534,11 +534,12 @@ class DockerCaddyController(CaddyController):
                     os.fsync(handle.fileno())
             directory = os.open(self.router_path, os.O_RDONLY)
             try:
-                self._reload_path(candidate)
                 try:
+                    # A failed Docker command may still have changed the live config.
+                    self._reload_path(candidate)
                     candidate.replace(self.config_path)
                     os.fsync(directory)
-                except OSError as exc:
+                except (OSError, CaddyError) as exc:
                     try:
                         self._reload_path(backup)
                         shutil.copyfile(backup, candidate)
@@ -549,13 +550,13 @@ class DockerCaddyController(CaddyController):
                         os.fsync(directory)
                     except (OSError, CaddyError) as rollback:
                         preserve_backup = True
-                        raise CaddyError(
-                            f"Configuration persistence failed ({exc}); "
+                        raise CaddyRecoveryError(
+                            f"Configuration apply failed ({exc}); "
                             f"rollback failed ({rollback}). "
                             f"Inspect {staging} and the live router before retrying."
                         ) from rollback
                     raise CaddyError(
-                        f"Configuration persistence failed; previous configuration restored: {exc}"
+                        f"Configuration apply failed; previous configuration restored: {exc}"
                     ) from exc
             finally:
                 os.close(directory)

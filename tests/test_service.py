@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import socket
+import stat
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from yan_port.caddy import DockerCaddyController
 from yan_port.context import detect_context
 from yan_port.errors import CaddyError, ConflictError, ContextError
 from yan_port.registry import StateStore
@@ -160,6 +163,83 @@ def test_route_failure_keeps_registry_unchanged(
         )
     assert manager.status() == before
     assert not store.journal_path.exists()
+
+
+@pytest.mark.parametrize("failure", ["reload", "replace", "sync"])
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_docker_apply_failure_preserves_recoverable_transaction(
+    tmp_path, monkeypatch, checkouts, failure, rollback_fails
+):
+    primary, _ = checkouts
+    store = StateStore(tmp_path / "state")
+    controller = DockerCaddyController(state_path=tmp_path)
+    controller.router_path.mkdir()
+    manager = YanPortService(store, controller)
+    manager.ensure_context(project="example-app", domain="example.localhost", cwd=primary)
+    previous = store.load()
+    previous_config = controller.render(previous)
+    controller.config_path.write_text(previous_config)
+    monkeypatch.setattr(controller, "status", lambda: "running")
+    monkeypatch.setattr(controller, "validate", lambda content: None)
+    reject_recovery = rollback_fails
+    live = previous_config
+
+    def reload(path):
+        nonlocal live
+        content = path.read_text()
+        if reject_recovery and content == previous_config:
+            raise CaddyError("recovery rejected")
+        live = content
+        if failure == "reload" and content != previous_config:
+            raise CaddyError("transport failed after candidate became active")
+
+    monkeypatch.setattr(controller, "_reload_path", reload)
+    replace = Path.replace
+
+    def fail_replace(path, target):
+        if (
+            failure == "replace"
+            and target == controller.config_path
+            and path.read_text() != previous_config
+        ):
+            raise OSError("disk failure")
+        return replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    fsync = os.fsync
+    failed_sync = False
+
+    def fail_sync(fd):
+        nonlocal failed_sync
+        if (
+            failure == "sync"
+            and not failed_sync
+            and stat.S_ISDIR(os.fstat(fd).st_mode)
+            and live != previous_config
+        ):
+            failed_sync = True
+            raise OSError("directory sync failed")
+        return fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_sync)
+    with pytest.raises(CaddyError, match="rollback failed" if rollback_fails else "restored"):
+        manager.apply_route(
+            "hub", hostname="hub.example.localhost",
+            upstream="http://127.0.0.1:5173", cwd=primary,
+        )
+    assert store.load() == previous
+    assert store.journal_path.exists() is rollback_fails
+    if rollback_fails:
+        journal = store.journal_path.read_bytes()
+        with pytest.raises(CaddyError, match="recovery rejected"):
+            manager.ensure_context(project="example-app", domain="example.localhost", cwd=primary)
+        assert store.journal_path.read_bytes() == journal
+        assert store.load() == previous
+        reject_recovery = False
+        manager.ensure_context(project="example-app", domain="example.localhost", cwd=primary)
+    assert not store.journal_path.exists()
+    assert live == previous_config
+    assert controller.config_path.read_text() == previous_config
 
 
 def test_staged_route_is_validated_and_persisted_without_live_reload(

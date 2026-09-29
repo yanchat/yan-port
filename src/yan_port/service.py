@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from .caddy import CaddyController, validate_domain, validate_hostname, validate_upstream
 from .context import detect_context
-from .errors import CaddyError, ConflictError, ContextError
+from .errors import CaddyError, CaddyRecoveryError, ConflictError, ContextError
 from .registry import StateStore
 from .trust import TrustInspector
 
@@ -285,8 +285,11 @@ class YanPortService:
             self.caddy.apply(self.caddy.render(candidate))
             self.store.write(candidate)
             self.store.remove_journal()
+        except CaddyRecoveryError:
+            # Keep the transaction until both live and persisted state are recovered.
+            raise
         except CaddyError:
-            # Validation and /load failures leave Caddy's prior config active.
+            # The driver rejected the candidate or confirmed restoration.
             self.store.remove_journal()
             raise
 

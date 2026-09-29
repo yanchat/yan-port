@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from yan_port.caddy import DockerCaddyController, create_caddy_controller
-from yan_port.errors import CaddyError
+from yan_port.errors import CaddyError, CaddyRecoveryError
 from yan_port.registry import empty_registry
 
 
@@ -150,6 +150,8 @@ def test_apply_preserves_config_when_reload_fails(tmp_path: Path, monkeypatch) -
         controller.apply("new\n")
 
     assert config.read_text() == "old\n"
+    assert len(runner.commands) == 3
+    assert Path(runner.commands[-1][-3]) == Path(runner.commands[1][-3]).with_name("previous")
     assert not list(config_dir.glob(".reload-*"))
 
 
@@ -214,8 +216,11 @@ def test_persistence_failure_restores_previous_live_configuration(
         return fsync(fd)
 
     monkeypatch.setattr(os, "fsync", fail_directory_sync)
-    with pytest.raises(CaddyError, match="rollback failed" if rollback_fails else "restored"):
+    with pytest.raises(
+        CaddyError, match="rollback failed" if rollback_fails else "restored"
+    ) as error:
         controller.apply("new\n")
+    assert isinstance(error.value, CaddyRecoveryError) is rollback_fails
     assert controller.config_path.read_text() == (
         "new\n" if failure == "sync" and rollback_fails else "old\n"
     )

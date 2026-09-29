@@ -17,5 +17,9 @@ class CaddyError(YanPortError):
     """Caddy rejected a candidate configuration or could not be contacted."""
 
 
+class CaddyRecoveryError(CaddyError):
+    """The prior live and persisted configuration could not be restored."""
+
+
 class TrustError(YanPortError):
     """Local certificate trust could not be inspected or changed safely."""
