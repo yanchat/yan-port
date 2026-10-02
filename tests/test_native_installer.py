@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from yan_port.caddy import CaddyController
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -85,6 +87,105 @@ sys.exit(1 if command == os.environ["TEST_FAILURE"] else 0)
         {"active": active, "enabled": enabled} if failed else {"active": True, "enabled": True}
     )
     assert config.read_bytes() == config_before
+
+
+@pytest.mark.parametrize("with_routes", [False, True])
+def test_native_apply_allows_preflight_and_only_bootstrap_activation(tmp_path, with_routes):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copytree(ROOT / "deploy", tmp_path / "deploy")
+    units = tmp_path / "units"
+    units.mkdir()
+    shutil.copy(ROOT / "deploy/yan-port-caddy.service", units / "yan-port-caddy.service")
+    state = tmp_path / "state"
+    state.mkdir()
+    if state.stat().st_gid == 0:
+        os.chown(state, -1, 999)
+    config = state / "Caddyfile"
+    controller = CaddyController(
+        config_path=config,
+        admin_socket="/run/yan-port/caddy-admin.sock",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    controller.http_port, controller.https_port = 80, 443
+    registry = {"contexts": {}}
+    if with_routes:
+        registry["contexts"]["owner"] = {
+            "routes": {
+                "hub": {
+                    "hostname": "hub.example.localhost", "upstream": "http://127.0.0.1:28080"
+                }
+            }
+        }
+    controller.apply(controller.render(registry))
+    before = config.stat()
+    content = config.read_bytes()
+    assert before.st_uid == os.getuid()
+    assert before.st_mode & 0o777 == 0o640
+    if not with_routes:
+        assert content == (ROOT / "deploy/bootstrap.Caddyfile").read_bytes()
+
+    for name in ("install-service.sh", "activate-service.sh"):
+        body = (ROOT / "scripts" / name).read_text()
+        body = body.replace("${EUID}", "0").replace("$EUID", "0")
+        for directory, destination in (
+            ("/etc/systemd/system", units),
+            ("/run/systemd/system", tmp_path / "runtime"),
+            ("/usr/lib/systemd/system", tmp_path / "vendor"),
+            ("/lib/systemd/system", tmp_path / "legacy"),
+            ("/var/lib/yan-port", state),
+        ):
+            body = body.replace(directory, str(destination))
+        (scripts / name).write_text(body)
+
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    caddy_uid = os.getuid() + 1000
+    state_gid = state.stat().st_gid
+    # Account/directory ownership and service calls are simulated; config metadata is real.
+    stubs = {
+        "getent": (
+            f'case "$1" in passwd) echo "caddy:x:{caddy_uid}:{state_gid}'
+            f'::{state}:/usr/sbin/nologin";; '
+            f'group) echo "yan-port:x:{state_gid}:";; *) exit 99;; esac'
+        ),
+        "id": (
+            f'case "$1" in -nG) echo "caddy yan-port";; -G) echo "{state_gid}";; '
+            '*) exit 99;; esac'
+        ),
+        "systemctl": (
+            'case "$1" in is-active) echo active;; is-enabled) echo enabled;; '
+            '*) exit 99;; esac'
+        ),
+        "curl": 'echo "YanPort ready"',
+    }
+    for name, body in stubs.items():
+        tool = binary / name
+        tool.write_text(f"#!/bin/sh\n{body}\n")
+        tool.chmod(0o755)
+    stat_tool = binary / "stat"
+    stat_tool.write_text(f"""#!{sys.executable}
+import os, sys
+metadata = os.stat(sys.argv[-1])
+uid = {caddy_uid} if sys.argv[-1] == {str(state)!r} else metadata.st_uid
+values = {{"%u:%g": f"{{uid}}:{{metadata.st_gid}}", "%a": format(metadata.st_mode & 0o7777, "o")}}
+print(values[sys.argv[2]])
+""")
+    stat_tool.chmod(0o755)
+    for name, argument in (("install-service.sh", "--check"), ("activate-service.sh", "--yes")):
+        result = subprocess.run(
+            ["/bin/bash", str(scripts / name), argument],
+            env={**os.environ, "PATH": f"{binary}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+        )
+        rejected = with_routes and name == "activate-service.sh"
+        assert result.returncode == int(rejected), result.stderr
+        if rejected:
+            assert "unchanged bootstrap" in result.stderr
+        assert config.read_bytes() == content
+        assert config.stat().st_ino == before.st_ino
+        assert config.stat().st_mode == before.st_mode
 
 
 @pytest.mark.parametrize(
@@ -203,17 +304,25 @@ def test_service_account_preflight(tmp_path, account, groups, lookup_status, acc
 
 
 @pytest.mark.parametrize(
-    "group_status,group_entry,owner,accepted",
+    "group_status,group_entry,owner,config_owner,config_groups,mode,accepted",
     [
-        (0, "yan-port:x:999:", "998:999", True),
-        (0, "yan-port:x:999:", "1000:999", False),
-        (0, "yan-port:x:999:", "998:1000", False),
-        (0, "yan-port:x:0:", "998:0", False),
-        (2, "", "998:999", False),
-        (1, "", "998:999", False),
+        (0, "yan-port:x:999:", "998:999", "998:999", "998", "640", True),
+        (0, "yan-port:x:999:", "1000:999", "998:999", "999", "640", False),
+        (0, "yan-port:x:999:", "998:1000", "998:999", "999", "640", False),
+        (0, "yan-port:x:0:", "998:0", "998:0", "999", "640", False),
+        (2, "", "998:999", "998:999", "999", "640", False),
+        (1, "", "998:999", "998:999", "999", "640", False),
+        (0, "yan-port:x:999:", "998:999", "1000:999", "1000 999", "640", True),
+        (0, "yan-port:x:999:", "998:999", "1000:999", "1000 1999", "640", False),
+        (0, "yan-port:x:999:", "998:999", "1000:999", "", "640", False),
+        (0, "yan-port:x:999:", "998:999", "1000:1000", "1000 999", "640", False),
+        (0, "yan-port:x:999:", "998:999", "1000:999", "1000 999", "666", False),
+        (0, "yan-port:x:999:", "998:999", "998:999", "999", "600", False),
     ],
 )
-def test_state_ownership_preflight(tmp_path, group_status, group_entry, owner, accepted):
+def test_state_ownership_preflight(
+    tmp_path, group_status, group_entry, owner, config_owner, config_groups, mode, accepted
+):
     state = tmp_path / "state"
     state.mkdir()
     config = state / "Caddyfile"
@@ -227,7 +336,12 @@ def test_state_ownership_preflight(tmp_path, group_status, group_entry, owner, a
     binary.mkdir()
     for name, body in {
         "getent": 'printf "%s\\n" "$GROUP_ENTRY"; exit "$GROUP_STATUS"',
-        "stat": 'printf "%s\\n" "$STATE_OWNER"',
+        "stat": (
+            'if [ "$2" = %a ]; then printf "%s\\n" "$CONFIG_MODE"; '
+            'elif [ "$3" = "$CONFIG_PATH" ]; then printf "%s\\n" "$CONFIG_OWNER"; '
+            'else printf "%s\\n" "$STATE_OWNER"; fi'
+        ),
+        "id": 'test -n "$CONFIG_GROUPS" || exit 1; printf "%s\\n" "$CONFIG_GROUPS"',
     }.items():
         tool = binary / name
         tool.write_text(f"#!/bin/sh\n{body}\n")
@@ -242,6 +356,10 @@ def test_state_ownership_preflight(tmp_path, group_status, group_entry, owner, a
             "GROUP_ENTRY": group_entry,
             "GROUP_STATUS": str(group_status),
             "STATE_OWNER": owner,
+            "CONFIG_PATH": str(config),
+            "CONFIG_OWNER": config_owner,
+            "CONFIG_GROUPS": config_groups,
+            "CONFIG_MODE": mode,
             "check_only": "false",
         },
         capture_output=True,

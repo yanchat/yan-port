@@ -620,6 +620,83 @@ def test_macos_trust_install_exports_exact_root_and_calls_security(tmp_path: Pat
         inspector.export(registry(), tmp_path / "unused.crt")
 
 
+@pytest.mark.parametrize("anchor_exists", [False, True])
+@pytest.mark.parametrize(
+    "error", [None, "admin trust removal denied", "certificate deletion failed", ""]
+)
+def test_macos_trust_remove_targets_active_root_and_trust_settings(
+    tmp_path: Path, anchor_exists: bool, error: str | None
+) -> None:
+    root = make_ca("Active")
+    fingerprint = certificate_sha256(load_certificate(root))
+    anchor = tmp_path / "root.crt"
+    if anchor_exists:
+        anchor.write_bytes(root)
+    foreign = tmp_path / "foreign.crt"
+    foreign_root = make_ca("Foreign")
+    foreign.write_bytes(foreign_root)
+    commands = []
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, int(error is not None), error or "", "")
+
+    inspector = TrustInspector(
+        FakeCaddy(root), system_anchor_path=anchor, platform_name="Darwin", runner=runner
+    )
+    if error is None:
+        assert inspector.remove(registry()) == {
+            "changed": True,
+            "sha256": fingerprint,
+            "keychain": "system",
+        }
+        assert not anchor.exists()
+    else:
+        with pytest.raises(TrustError, match=error or "macOS trust removal failed"):
+            inspector.remove(registry())
+        assert anchor.exists() is anchor_exists
+        if anchor_exists:
+            assert anchor.read_bytes() == root
+    assert commands == [
+        [
+            "sudo", "/usr/bin/security", "delete-certificate", "-t", "-Z",
+            fingerprint.upper(), "/Library/Keychains/System.keychain",
+        ]
+    ]
+    assert foreign.read_bytes() == foreign_root
+
+
+@pytest.mark.parametrize("conflict", ["certificate", "appended", "symlink", "directory"])
+def test_macos_trust_remove_preserves_conflicting_anchor(tmp_path: Path, conflict: str) -> None:
+    root = make_ca("Active")
+    anchor = tmp_path / "root.crt"
+    original = make_ca("Foreign") if conflict == "certificate" else root + b"extra\n"
+    if conflict == "symlink":
+        target = tmp_path / "foreign.crt"
+        target.write_bytes(original)
+        anchor.symlink_to(target)
+    elif conflict == "directory":
+        anchor.mkdir()
+    else:
+        anchor.write_bytes(original)
+    before = anchor.lstat()
+    calls = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    inspector = TrustInspector(
+        FakeCaddy(root), system_anchor_path=anchor, platform_name="Darwin", runner=runner
+    )
+    with pytest.raises(TrustError, match="anchor"):
+        inspector.remove(registry())
+    assert calls == []
+    assert anchor.lstat() == before
+    if conflict != "directory":
+        assert anchor.read_bytes() == original
+
+
 @pytest.mark.parametrize("conflict", ["certificate", "appended", "symlink"])
 def test_macos_trust_install_preserves_conflicting_anchor(tmp_path: Path, conflict: str) -> None:
     root = make_ca("Active")

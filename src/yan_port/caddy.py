@@ -68,13 +68,15 @@ def render_caddyfile(
     admin_address: str | None = None,
     http_port: int = 80,
     https_port: int = 443,
+    redirect_https_port: int = 443,
     proxy_loopback_host: str | None = None,
     bind_loopback: bool = True,
 ) -> str:
-    if not 1 <= http_port <= 65535 or not 1 <= https_port <= 65535:
+    if not all(1 <= port <= 65535 for port in (http_port, https_port, redirect_https_port)):
         raise ValueError("Caddy listener ports must be within 1..65535")
     if http_port == https_port:
         raise ValueError("Caddy HTTP and HTTPS listener ports must differ")
+    redirect_port = f":{redirect_https_port}" if redirect_https_port != 443 else ""
     lines = [
         "{",
         f"\tadmin {admin_address or f'unix/{admin_socket}|0660'}",
@@ -100,7 +102,7 @@ def render_caddyfile(
             https_lines.append("\tbind 127.0.0.1 [::1]")
             http_lines.append("\tbind 127.0.0.1 [::1]")
         https_lines.extend(["\ttls internal", f"\treverse_proxy {upstream}", "}", ""])
-        http_lines.extend([f"\tredir https://{hostname}{{uri}} permanent", "}", ""])
+        http_lines.extend([f"\tredir https://{hostname}{redirect_port}{{uri}} permanent", "}", ""])
         lines.extend([*https_lines, *http_lines])
     if not routes:
         lines.extend([":2018 {", "\tbind 127.0.0.1", '\trespond "YanPort ready"', "}", ""])
@@ -336,6 +338,7 @@ class DockerCaddyController(CaddyController):
             admin_address="localhost:2019",
             http_port=self.http_port,
             https_port=self.https_port,
+            redirect_https_port=self.https_port,
             proxy_loopback_host="host.docker.internal",
             bind_loopback=False,
         )

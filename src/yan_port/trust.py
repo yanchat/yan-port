@@ -490,13 +490,19 @@ class TrustInspector:
     def remove(self, registry: dict[str, Any]) -> dict[str, Any]:
         if self.platform_name != "Darwin":
             raise TrustError("automatic trust removal is available only on macOS")
-        _root_pem, root = self._active_root()
+        root_pem, root = self._active_root()
+        anchor = self.system_anchor_path
+        if anchor.is_symlink() or (
+            anchor.exists() and (not anchor.is_file() or anchor.read_bytes() != root_pem)
+        ):
+            raise TrustError(f"Refusing CA anchor that differs from the active root: {anchor}")
         fingerprint = certificate_sha256(root).upper()
         result = self.runner(
             [
                 "sudo",
                 "/usr/bin/security",
                 "delete-certificate",
+                "-t",  # Also remove admin trust settings when running as root.
                 "-Z",
                 fingerprint,
                 "/Library/Keychains/System.keychain",

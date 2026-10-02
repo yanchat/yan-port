@@ -77,7 +77,8 @@ yan-port trust status
 System-trust inspection and repair support the Debian-style Linux layout used
 by YanPort's native-Caddy deployment. On macOS, `yan-port trust install`
 exports the exact active Docker Caddy root and installs it into System Keychain;
-`yan-port trust remove --yes` removes that exact fingerprint. Windows trust
+`yan-port trust remove --yes` removes that exact fingerprint and its admin trust
+settings; a conflicting local anchor is preserved and removal is refused. Windows trust
 stores remain unsupported.
 
 macOS installation preserves an existing differing anchor instead of replacing

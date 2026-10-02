@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from yan_port.caddy import DockerCaddyController, create_caddy_controller
+from yan_port.caddy import CaddyController, DockerCaddyController, create_caddy_controller
 from yan_port.errors import CaddyError, CaddyRecoveryError
 from yan_port.registry import empty_registry
 
@@ -72,6 +72,24 @@ def test_docker_render_keeps_registry_loopback_but_proxies_to_host(tmp_path: Pat
     assert routed_registry()["contexts"]["owner"]["routes"]["hub"]["upstream"] == (
         "http://127.0.0.1:28080"
     )
+
+
+@pytest.mark.parametrize("driver", ["native", "docker"])
+@pytest.mark.parametrize("http_port,https_port", [(80, 443), (8088, 8443)])
+def test_render_redirect_uses_driver_public_port(
+    tmp_path, monkeypatch, driver, http_port, https_port
+):
+    monkeypatch.setenv("YAN_PORT_HTTP_PORT", str(http_port))
+    monkeypatch.setenv("YAN_PORT_HTTPS_PORT", str(https_port))
+    controller = (
+        DockerCaddyController(state_path=tmp_path)
+        if driver == "docker"
+        else CaddyController(config_path=tmp_path / "Caddyfile")
+    )
+    rendered = controller.render(routed_registry())
+    port = f":{https_port}" if driver == "docker" and https_port != 443 else ""
+    assert f"https_port {https_port}" in rendered
+    assert f"redir https://hub.example.localhost{port}{{uri}} permanent" in rendered
 
 
 def test_install_creates_owned_volume_and_loopback_container(tmp_path: Path) -> None:
@@ -393,14 +411,24 @@ def test_lifecycle_accepts_only_complete_owned_contract(
             assert result["changed"] == (operation in {"stop", "uninstall"})
 
 
-def test_cli_custom_ports_keep_docker_upstream_translation(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("driver", ["native", "docker"])
+@pytest.mark.parametrize("custom_ports", [False, True])
+def test_cli_render_keeps_driver_upstream_and_redirect_ports(
+    monkeypatch, tmp_path, driver, custom_ports
+):
     from types import SimpleNamespace
 
     from typer.testing import CliRunner
 
     from yan_port import cli
 
-    controller = DockerCaddyController(state_path=tmp_path)
+    monkeypatch.setenv("YAN_PORT_HTTP_PORT", "80")
+    monkeypatch.setenv("YAN_PORT_HTTPS_PORT", "443")
+    controller = (
+        DockerCaddyController(state_path=tmp_path)
+        if driver == "docker"
+        else CaddyController(config_path=tmp_path / "Caddyfile")
+    )
     monkeypatch.setattr(
         cli,
         "_service",
@@ -409,10 +437,15 @@ def test_cli_custom_ports_keep_docker_upstream_translation(monkeypatch, tmp_path
             status=routed_registry,
         ),
     )
-    result = CliRunner().invoke(
-        cli.app, ["router", "render", "--http-port", "8088", "--https-port", "8443"]
-    )
+    arguments = ["router", "render"]
+    if custom_ports:
+        arguments.extend(["--http-port", "8088", "--https-port", "8443"])
+    result = CliRunner().invoke(cli.app, arguments)
     assert result.exit_code == 0, result.output
-    assert "http_port 8088" in result.output
-    assert "host.docker.internal" in result.output
-    assert "unix/" not in result.output
+    assert f"http_port {8088 if custom_ports else 80}" in result.output
+    assert f"https_port {8443 if custom_ports else 443}" in result.output
+    upstream_host = "host.docker.internal" if driver == "docker" else "127.0.0.1"
+    assert f"reverse_proxy http://{upstream_host}:28080" in result.output
+    port = ":8443" if driver == "docker" and custom_ports else ""
+    assert f"redir https://hub.example.localhost{port}{{uri}} permanent" in result.output
+    assert ("unix/" in result.output) is (driver == "native")

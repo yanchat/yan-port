@@ -85,14 +85,28 @@ else
   state_gid=""
 fi
 
-for path in /var/lib/yan-port /var/lib/yan-port/Caddyfile; do
-  if [[ -e "$path" ]]; then
-    [[ -n "${uid:-}" && -n "$state_gid" && "$(stat -c '%u:%g' "$path")" == "$uid:$state_gid" ]] || {
-      echo "Existing YanPort state has unverified ownership; preserve it and resolve explicitly: $path" >&2
+if [[ -d /var/lib/yan-port ]]; then
+  [[ -n "$uid" && -n "$state_gid" && "$(stat -c '%u:%g' /var/lib/yan-port)" == "$uid:$state_gid" ]] || {
+    echo "Existing YanPort state has unverified ownership; preserve it and resolve explicitly: /var/lib/yan-port" >&2
+    exit 1
+  }
+fi
+if [[ -f /var/lib/yan-port/Caddyfile ]]; then
+  owner="$(stat -c '%u:%g' /var/lib/yan-port/Caddyfile)"
+  config_uid="${owner%%:*}"
+  [[ -n "$uid" && -n "$state_gid" && "$owner" == "$config_uid:$state_gid" &&
+     "$(stat -c '%a' /var/lib/yan-port/Caddyfile)" == 640 ]] || {
+    echo "Existing Caddyfile has unverified group or mode; preserve it and resolve explicitly" >&2
+    exit 1
+  }
+  # Atomic route updates belong to the developer who applied them.
+  if [[ "$config_uid" != "$uid" ]]; then
+    if ! config_groups="$(id -G "$config_uid")" || [[ " $config_groups " != *" $state_gid "* ]]; then
+      echo "Existing Caddyfile owner is not a verified yan-port group member; preserve it and resolve explicitly" >&2
       exit 1
-    }
+    fi
   fi
-done
+fi
 
 if [[ "$check_only" == true ]]; then
   echo "Native service preflight passed; no accounts or services changed."

@@ -84,9 +84,11 @@ The installer rejects per-unit override directories and competing runtime/vendor
 units. An existing `caddy` account must use YanPort's service home, a nologin
 shell, non-root IDs and no root/sudo/wheel/docker group membership. Lookup
 failures stop provisioning rather than being treated as a missing account.
-Existing state directories and Caddyfiles must match that account and the
-non-root `yan-port` group. Unverified ownership is refused, not corrected with
-`chown`; existing state-directory permissions are preserved.
+Existing state directories must match that account and the non-root `yan-port`
+group. Caddyfiles must have that group and mode `0640`; their owner may be `caddy`
+or a verified `yan-port` group member who applied routes. Unverified ownership
+is refused, not corrected with `chown`; existing state-directory permissions
+are preserved.
 
 Provisioning installs `/usr/local/bin/caddy` and the dormant native service.
 After re-login, a fresh installation with the unchanged bootstrap can be
