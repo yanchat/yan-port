@@ -5,6 +5,7 @@ import os
 import socket
 import stat
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 
@@ -128,6 +129,52 @@ def test_native_service_recovers_after_failure() -> None:
     assert "RestartSec=2s" in unit
 
 
+@pytest.mark.parametrize(
+    "output,expected",
+    [
+        ("LoadState=loaded\nActiveState=active\n", "active"),
+        ("ActiveState=inactive\nLoadState=loaded\n", "inactive"),
+        ("LoadState=loaded\nActiveState=failed\n", "failed"),
+        ("LoadState=not-found\nActiveState=inactive\n", "not-installed"),
+    ],
+)
+def test_native_status_reads_systemd_properties(output: str, expected: str) -> None:
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command == [
+            "systemctl",
+            "show",
+            "yan-port-caddy.service",
+            "--property=LoadState",
+            "--property=ActiveState",
+        ]
+        return subprocess.CompletedProcess(command, 0, output)
+
+    assert CaddyController(runner=run).status() == expected
+
+
+@pytest.mark.parametrize(
+    "code,output",
+    [
+        (1, "Failed to connect to bus"),
+        (1, "LoadState=not-found\nActiveState=inactive\n"),
+        (0, ""),
+        (0, "ActiveState=active\n"),
+        (0, "LoadState=loaded\nActiveState=\n"),
+        (0, "LoadState=loaded\nLoadState=not-found\nActiveState=inactive\n"),
+        (0, "LoadState=masked\nActiveState=inactive\n"),
+        (0, "LoadState=error\nActiveState=inactive\n"),
+        (0, "LoadState=not-found\nActiveState=active\n"),
+        (0, "LoadState=loaded\nActiveState=unexpected state\n"),
+    ],
+)
+def test_native_status_does_not_hide_inspection_errors(code: int, output: str) -> None:
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, code, output)
+
+    with pytest.raises(CaddyError):
+        CaddyController(runner=run).status()
+
+
 def _serve_unix_response(socket_path: Path, body: bytes) -> threading.Thread:
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
@@ -151,8 +198,14 @@ def _serve_unix_response(socket_path: Path, body: bytes) -> threading.Thread:
     return thread
 
 
-def test_fetch_root_certificate_uses_permissioned_admin_socket(tmp_path: Path) -> None:
-    socket_path = tmp_path / "admin.sock"
+@pytest.fixture
+def short_socket_root():
+    with tempfile.TemporaryDirectory(prefix="yp-", dir="/tmp") as directory:
+        yield Path(directory)
+
+
+def test_fetch_root_certificate_uses_permissioned_admin_socket(short_socket_root: Path) -> None:
+    socket_path = short_socket_root / "admin.sock"
     root = "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"
     thread = _serve_unix_response(
         socket_path,
@@ -167,12 +220,15 @@ def test_fetch_root_certificate_uses_permissioned_admin_socket(tmp_path: Path) -
     assert not thread.is_alive()
 
 
-def test_fetch_root_certificate_categorizes_socket_and_response_errors(tmp_path: Path) -> None:
-    missing = CaddyController(admin_socket=str(tmp_path / "missing.sock"))
+def test_fetch_root_certificate_categorizes_socket_and_response_errors(
+    short_socket_root: Path,
+) -> None:
+    missing_path = short_socket_root / "missing.sock"
+    missing = CaddyController(admin_socket=str(missing_path))
     with pytest.raises(CaddyError, match="admin socket is missing"):
         missing.fetch_root_certificate()
 
-    socket_path = tmp_path / "malformed.sock"
+    socket_path = short_socket_root / "malformed.sock"
     thread = _serve_unix_response(socket_path, b"{}")
     malformed = CaddyController(admin_socket=str(socket_path))
     with pytest.raises(CaddyError, match="malformed root certificate response"):
